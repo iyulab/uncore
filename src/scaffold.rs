@@ -72,6 +72,124 @@ macro_rules! with_c_str {
     };
 }
 
+/// Declare an opaque document handle and the function that frees it.
+///
+/// The handle is what a C caller holds: a `#[repr(C)]` newtype around the library's own
+/// document type with one private field. The field name is given rather than invented,
+/// because every entry point projects through it (`(*doc).inner`) and that has to be
+/// readable in the consuming source.
+///
+/// `#[repr(C)]` is emitted because the three shipped libraries declare it. It says
+/// nothing useful about a Rust field, and it is kept only so that adopting this macro
+/// leaves the declared type identical.
+///
+/// ```
+/// # struct Document;
+/// uncore::export_handle! {
+///     /// Opaque handle to a parsed document.
+///     handle DemoDoc { inner: Document },
+///
+///     /// Free a document handle.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `doc` must be a pointer a parse function returned, or null.
+///     /// - After this call the handle is invalid and must not be used.
+///     free demo_release_document,
+/// }
+/// ```
+#[macro_export]
+macro_rules! export_handle {
+    (
+        $(#[$handle_meta:meta])*
+        handle $handle:ident { $field:ident: $inner:ty },
+
+        $(#[$free_meta:meta])*
+        free $free_fn:ident $(,)?
+    ) => {
+        $(#[$handle_meta])*
+        #[repr(C)]
+        pub struct $handle {
+            $field: $inner,
+        }
+
+        $(#[$free_meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $free_fn(doc: *mut $handle) {
+            if !doc.is_null() {
+                // Wrapped explicitly rather than relying on the unsafe fn body: this
+                // expands both in crates that deny `unsafe_op_in_unsafe_fn` and in crates
+                // that do not, and a block around a genuinely unsafe operation is correct
+                // under either.
+                let _ = unsafe { ::std::boxed::Box::from_raw(doc) };
+            }
+        }
+    };
+}
+
+/// Declare the release function for strings this library hands out.
+///
+/// Every entry point returning `*mut c_char` transfers ownership, so exactly one of these
+/// belongs beside them. Reclaiming the allocation has to happen in the library that made
+/// it, which is why it cannot be `free()` on the caller's side.
+///
+/// ```
+/// uncore::export_free_string!(
+///     /// Free a string produced by this library.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `s` must be a pointer this library returned, or null.
+///     demo_release_string
+/// );
+/// ```
+#[macro_export]
+macro_rules! export_free_string {
+    ($(#[$meta:meta])* $free_fn:ident) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $free_fn(s: *mut ::std::ffi::c_char) {
+            if !s.is_null() {
+                let _ = unsafe { ::std::ffi::CString::from_raw(s) };
+            }
+        }
+    };
+}
+
+/// Declare the release function for byte buffers this library hands out.
+///
+/// The length is taken back because the buffer was a `Box<[u8]>`: reconstructing it needs
+/// the same length the producing call reported. A zero length is ignored rather than
+/// reclaimed — an empty boxed slice has no allocation to return.
+///
+/// ```
+/// uncore::export_free_bytes!(
+///     /// Free a byte buffer produced by this library.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `data` must be a pointer this library returned, or null.
+///     /// - `len` must be the length that call reported.
+///     demo_release_bytes
+/// );
+/// ```
+#[macro_export]
+macro_rules! export_free_bytes {
+    ($(#[$meta:meta])* $free_fn:ident) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $free_fn(data: *mut u8, len: usize) {
+            if !data.is_null() && len > 0 {
+                let _ = unsafe {
+                    ::std::boxed::Box::from_raw(::std::ptr::slice_from_raw_parts_mut(
+                        data, len,
+                    ))
+                };
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, CString};
@@ -108,5 +226,92 @@ mod tests {
             !failure.1.is_empty(),
             "the conversion error must survive as a message"
         );
+    }
+
+    use std::collections::HashMap;
+
+    use crate::ffi::LastErrorSlot;
+
+    /// Stands in for a library's document. Deliberately not a document: the fields are
+    /// only the *shapes* an entry point returns — a string, an absent string, a count,
+    /// a byte buffer keyed by name.
+    // `body`, `title` and `blobs` are each read by a macro added in Task 3, 4 and 5.
+    // Remove this allow at the end of Task 6, when all three have readers.
+    #[allow(dead_code)]
+    #[derive(Default)]
+    struct Demo {
+        body: String,
+        title: Option<String>,
+        blobs: HashMap<String, Vec<u8>>,
+    }
+
+    thread_local! {
+        static DEMO_ERROR: LastErrorSlot = const { LastErrorSlot::new() };
+    }
+
+    crate::export_last_error_abi!(DEMO_ERROR, demo_last_error, demo_last_error_kind);
+
+    crate::export_handle! {
+        /// Opaque handle to a demo document.
+        handle DemoDocument { inner: Demo },
+
+        /// Free a demo handle.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a pointer this test module produced, or null.
+        /// - After this call the handle is invalid and must not be used.
+        free demo_free_document,
+    }
+
+    crate::export_free_string!(
+        /// Free a string produced by a demo entry point.
+        ///
+        /// # Safety
+        ///
+        /// - `s` must be a pointer a demo entry point returned, or null.
+        demo_free_string
+    );
+
+    crate::export_free_bytes!(
+        /// Free a byte buffer produced by a demo entry point.
+        ///
+        /// # Safety
+        ///
+        /// - `data` must be a pointer a demo entry point returned, or null.
+        /// - `len` must be the length that call reported.
+        demo_free_bytes
+    );
+
+    fn demo(inner: Demo) -> *mut DemoDocument {
+        Box::into_raw(Box::new(DemoDocument { inner }))
+    }
+
+    #[test]
+    fn a_handle_round_trips_through_its_free_function() {
+        let doc = demo(Demo::default());
+        assert!(!doc.is_null());
+        // A leak would show up under the test harness's allocator, and a double free
+        // would abort; this asserts the pair exists and accepts what the other produced.
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn every_free_function_accepts_null() {
+        unsafe {
+            demo_free_document(std::ptr::null_mut());
+            demo_free_string(std::ptr::null_mut());
+            demo_free_bytes(std::ptr::null_mut(), 0);
+        }
+    }
+
+    #[test]
+    fn free_bytes_ignores_a_zero_length_buffer() {
+        // The shipped ABI guards on `len > 0`, so a caller passing a real pointer with a
+        // zero length must not have it reclaimed. Pinned because the guard reads like a
+        // redundant check and is not one.
+        let mut byte = 7u8;
+        unsafe { demo_free_bytes(&mut byte, 0) };
+        assert_eq!(byte, 7);
     }
 }
