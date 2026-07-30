@@ -1,0 +1,23 @@
+[package]
+name = "uncore"
+version = "0.1.0"
+edition = "2021"
+authors = ["iyulab"]
+license = "MIT"
+description = "Shared C-ABI plumbing and error-kind conventions for the un* document extraction family"
+repository = "https://github.com/iyulab/uncore"
+homepage = "https://github.com/iyulab/uncore"
+documentation = "https://docs.rs/uncore"
+readme = "README.md"
+keywords = ["ffi", "c-abi", "error-handling", "document", "extraction"]
+categories = ["development-tools::ffi", "api-bindings"]
+rust-version = "1.87"
+
+# No dependencies, and none are wanted. Everything here is std plumbing that three
+# published cdylibs link statically; a dependency added to this crate is a dependency
+# added to all of them.
+[dependencies]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
