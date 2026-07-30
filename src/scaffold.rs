@@ -502,6 +502,169 @@ macro_rules! export_count_getter {
     };
 }
 
+/// Declare an entry point that hands out an owned byte buffer selected by a C-string key.
+///
+/// The signature is fixed — `(handle, key, out_len) -> *mut u8` — because that is the
+/// shape every consumer of this ABI already exports, and only the names come from the call
+/// site. An entry point needing a different shape is written by hand.
+///
+/// `$body` evaluates to `Result<Vec<u8>, FfiError>`. The macro moves that into a
+/// `Box<[u8]>`, writes its length through `out_len`, and hands over the pointer; the
+/// matching [`export_free_bytes!`](crate::export_free_bytes) reclaims it from the same two
+/// values.
+///
+/// # Why every argument is checked before the closure
+///
+/// The failure path writes `*out_len = 0`, so *when* an argument is rejected is
+/// observable. All three null checks therefore happen before
+/// [`catch`](crate::ffi::catch) runs, and a rejected argument leaves the caller's length
+/// variable exactly as they left it — "not attempted" stays distinguishable from
+/// "attempted and produced nothing".
+///
+/// That is also why `$body` reads the key with
+/// [`ffi::c_str_utf8`](crate::ffi::c_str_utf8) rather than
+/// [`with_c_str!`](crate::with_c_str): the null check is already done, and the UTF-8
+/// conversion belongs inside the closure, where its failure does zero the length.
+///
+/// ```
+/// # use std::collections::HashMap;
+/// # use std::ffi::CString;
+/// # use uncore::ffi::LastErrorSlot;
+/// # struct Archive { entries: HashMap<String, Vec<u8>> }
+/// # thread_local! { static LAST_ERROR: LastErrorSlot = const { LastErrorSlot::new() }; }
+/// # uncore::export_last_error_abi!(LAST_ERROR, demo5_last_error, demo5_last_error_kind);
+/// # uncore::export_handle! {
+/// #     /// Handle.
+/// #     handle Demo5Document { inner: Archive },
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `doc` must come from this library.
+/// #     free demo5_free_document,
+/// # }
+/// # uncore::export_free_bytes!(
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `data` and `len` must come from this library.
+/// #     demo5_free_bytes
+/// # );
+/// uncore::export_bytes_getter!(
+///     /// The bytes of the entry named `name`.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `doc` must be a valid handle.
+///     /// - `name` must be a valid null-terminated UTF-8 string.
+///     /// - `out_len` must point to storage for the length.
+///     /// - The returned pointer must be freed with `demo5_free_bytes`.
+///     LAST_ERROR,
+///     demo5_entry(doc: Demo5Document, name, out out_len),
+///     {
+///         let name = unsafe { uncore::ffi::c_str_utf8(name) }?;
+///         match unsafe { (*doc).inner.entries.get(name) } {
+///             Some(bytes) => Ok(bytes.clone()),
+///             None => Err((uncore::kind::OTHER, format!("no entry {name}"))),
+///         }
+///     }
+/// );
+///
+/// let mut entries = HashMap::new();
+/// entries.insert("a.bin".to_string(), vec![1u8, 2, 3]);
+/// let doc = Box::into_raw(Box::new(Demo5Document { inner: Archive { entries } }));
+/// let name = CString::new("a.bin").unwrap();
+///
+/// let mut out_len = 0usize;
+/// let bytes = unsafe { demo5_entry(doc, name.as_ptr(), &mut out_len) };
+/// assert_eq!(out_len, 3);
+/// assert_eq!(unsafe { std::slice::from_raw_parts(bytes, out_len) }, [1, 2, 3]);
+///
+/// unsafe {
+///     demo5_free_bytes(bytes, out_len);
+///     demo5_free_document(doc);
+/// }
+/// ```
+#[macro_export]
+macro_rules! export_bytes_getter {
+    (
+        $(#[$meta:meta])*
+        $slot:path,
+        $name:ident($handle:ident: $handle_ty:ty, $key:ident, out $out_len:ident $(,)?),
+        $body:block
+    ) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            $handle: *const $handle_ty,
+            $key: *const ::std::ffi::c_char,
+            $out_len: *mut usize,
+        ) -> *mut u8 {
+            $slot.with(|slot| $crate::ffi::LastErrorSlot::clear(slot));
+
+            // Checked before the closure: the failure path below writes through
+            // `$out_len`, so a rejected argument must leave it as the caller left it.
+            if $handle.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument("document is null"),
+                    )
+                });
+                return ::std::ptr::null_mut();
+            }
+
+            if $key.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument(concat!(
+                            stringify!($key),
+                            " is null"
+                        )),
+                    )
+                });
+                return ::std::ptr::null_mut();
+            }
+
+            if $out_len.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument(concat!(
+                            stringify!($out_len),
+                            " is null"
+                        )),
+                    )
+                });
+                return ::std::ptr::null_mut();
+            }
+
+            let produced: ::std::result::Result<
+                ::std::vec::Vec<u8>,
+                $crate::ffi::FfiError,
+            > = $crate::ffi::catch(|| $body);
+
+            match produced {
+                ::std::result::Result::Ok(data) => {
+                    let length = data.len();
+                    let raw =
+                        ::std::boxed::Box::into_raw(data.into_boxed_slice()) as *mut u8;
+                    // The null check above is what makes this write sound; wrapped
+                    // explicitly so the expansion compiles under
+                    // `unsafe_op_in_unsafe_fn` too.
+                    unsafe { *$out_len = length };
+                    raw
+                }
+                ::std::result::Result::Err(error) => {
+                    $slot.with(|slot| $crate::ffi::LastErrorSlot::set_error(slot, &error));
+                    unsafe { *$out_len = 0 };
+                    ::std::ptr::null_mut()
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, CString};
@@ -547,9 +710,6 @@ mod tests {
     /// Stands in for a library's document. Deliberately not a document: the fields are
     /// only the *shapes* an entry point returns — a string, an absent string, a count,
     /// a byte buffer keyed by name.
-    // `body`, `title` and `blobs` are each read by a macro added in Task 3, 4 and 5.
-    // Remove this allow at the end of Task 6, when all three have readers.
-    #[allow(dead_code)]
     #[derive(Default)]
     struct Demo {
         body: String,
@@ -884,5 +1044,122 @@ mod tests {
             "a count of zero is a success, not a leftover failure"
         );
         unsafe { demo_free_document(doc) };
+    }
+
+    crate::export_bytes_getter!(
+        /// The bytes of the blob named `id`.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        /// - `id` must be a valid null-terminated UTF-8 string.
+        /// - `out_len` must point to storage for the length.
+        /// - The returned pointer must be freed with `demo_free_bytes`.
+        DEMO_ERROR,
+        demo_blob(doc: DemoDocument, id, out out_len),
+        {
+            let id = unsafe { crate::ffi::c_str_utf8(id) }?;
+            match unsafe { (*doc).inner.blobs.get(id) } {
+                Some(data) => Ok(data.clone()),
+                None => Err((crate::kind::OTHER, format!("no blob {id}"))),
+            }
+        }
+    );
+
+    #[test]
+    fn a_bytes_getter_hands_over_the_buffer_and_its_length() {
+        let doc = demo_with_blob("logo.png", b"\x89PNG\r\n");
+        let id = CString::new("logo.png").unwrap();
+
+        let mut out_len: usize = 0;
+        let data = unsafe { demo_blob(doc, id.as_ptr(), &mut out_len) };
+        assert!(!data.is_null());
+        assert_eq!(out_len, 6);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(data, out_len) },
+            b"\x89PNG\r\n"
+        );
+
+        unsafe {
+            demo_free_bytes(data, out_len);
+            demo_free_document(doc);
+        }
+    }
+
+    /// The behaviour this macro checks all three arguments before the closure for: a
+    /// rejected argument leaves the caller's length variable exactly as they left it, so
+    /// "not attempted" stays distinguishable from "attempted and produced nothing".
+    #[test]
+    fn a_rejected_argument_leaves_out_len_untouched() {
+        let doc = demo_with_blob("logo.png", b"\x89PNG");
+        let id = CString::new("logo.png").unwrap();
+        const SEEDED: usize = 0xDEAD;
+
+        let mut out_len: usize = SEEDED;
+        assert!(unsafe { demo_blob(std::ptr::null(), id.as_ptr(), &mut out_len) }.is_null());
+        assert_eq!(out_len, SEEDED, "a null handle must not write out_len");
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+
+        assert!(unsafe { demo_blob(doc, std::ptr::null(), &mut out_len) }.is_null());
+        assert_eq!(out_len, SEEDED, "a null key must not write out_len");
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+
+        // A key that is merely absent *is* attempted, so the length is zeroed.
+        let missing = CString::new("absent.png").unwrap();
+        assert!(unsafe { demo_blob(doc, missing.as_ptr(), &mut out_len) }.is_null());
+        assert_eq!(out_len, 0, "a lookup that failed reports zero length");
+        assert_eq!(demo_last_error_kind(), crate::kind::OTHER);
+
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_null_out_len_is_rejected_and_named() {
+        let doc = demo_with_blob("logo.png", b"\x89PNG");
+        let id = CString::new("logo.png").unwrap();
+
+        assert!(unsafe { demo_blob(doc, id.as_ptr(), std::ptr::null_mut()) }.is_null());
+        let message = unsafe { std::ffi::CStr::from_ptr(demo_last_error()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(message, "out_len is null");
+
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_non_utf8_key_is_classified_and_zeroes_the_length() {
+        let doc = demo_with_blob("logo.png", b"\x89PNG");
+        let raw = [0xFFu8, 0x00];
+
+        let mut out_len: usize = 0xBEEF;
+        let data = unsafe { demo_blob(doc, raw.as_ptr() as *const c_char, &mut out_len) };
+        assert!(data.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+        assert_eq!(
+            out_len, 0,
+            "the conversion happens inside the closure, so the failure path runs"
+        );
+
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn an_empty_buffer_is_handed_over_as_a_non_null_pointer_with_zero_length() {
+        let doc = demo_with_blob("empty.bin", b"");
+        let id = CString::new("empty.bin").unwrap();
+
+        let mut out_len: usize = 9;
+        let data = unsafe { demo_blob(doc, id.as_ptr(), &mut out_len) };
+        assert!(
+            !data.is_null(),
+            "an empty blob is a success, not an absent one"
+        );
+        assert_eq!(out_len, 0);
+
+        unsafe {
+            demo_free_bytes(data, out_len);
+            demo_free_document(doc);
+        }
     }
 }
