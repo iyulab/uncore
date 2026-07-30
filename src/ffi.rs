@@ -36,7 +36,7 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, c_int, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::panic::{catch_unwind, UnwindSafe};
 use std::ptr;
 
@@ -164,6 +164,31 @@ pub fn invalid_output() -> FfiError {
         kind::INVALID_OUTPUT,
         "output contains null byte".to_string(),
     )
+}
+
+/// Read a non-null C string argument as `&str`, classifying a non-UTF-8 one.
+///
+/// Separate from [`with_c_str!`](crate::with_c_str) because an entry point with an
+/// out-parameter has to reject a null pointer *before* it starts producing a result — its
+/// failure path writes through that pointer — so it does its own null check and needs only
+/// the conversion. Everywhere else, [`with_c_str!`](crate::with_c_str) does both.
+///
+/// # Safety
+///
+/// `ptr` must be non-null and point to a NUL-terminated string that stays valid for `'a`.
+/// The lifetime is unbounded, as with [`std::ffi::CStr::from_ptr`]: nothing here can check
+/// how long the caller's buffer lives.
+///
+/// ```
+/// # use std::ffi::CString;
+/// let path = CString::new("document.pdf").unwrap();
+/// let read = unsafe { uncore::ffi::c_str_utf8(path.as_ptr()) };
+/// assert_eq!(read.unwrap(), "document.pdf");
+/// ```
+pub unsafe fn c_str_utf8<'a>(ptr: *const c_char) -> Result<&'a str, FfiError> {
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|error| invalid_argument(error.to_string()))
 }
 
 /// Declare `<name>_last_error` and `<name>_last_error_kind` over a [`LastErrorSlot`].

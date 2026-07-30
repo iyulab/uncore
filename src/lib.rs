@@ -84,3 +84,4 @@
 
 pub mod ffi;
 pub mod kind;
+pub mod scaffold;
