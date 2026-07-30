@@ -47,7 +47,7 @@
 /// # use std::ffi::{c_char, CString};
 /// # use uncore::ffi::FfiError;
 /// unsafe fn name_length(path: *const c_char) -> Result<usize, FfiError> {
-///     let path = uncore::with_c_str!(path)?;
+///     let path = unsafe { uncore::with_c_str!(path) }?;
 ///     Ok(path.len())
 /// }
 ///
@@ -67,7 +67,7 @@ macro_rules! with_c_str {
                 " is null"
             )))
         } else {
-            unsafe { $crate::ffi::c_str_utf8($ptr) }
+            $crate::ffi::c_str_utf8($ptr)
         }
     };
 }
@@ -79,7 +79,7 @@ mod tests {
     use crate::ffi::FfiError;
 
     unsafe fn read(ptr: *const c_char) -> Result<&'static str, FfiError> {
-        crate::with_c_str!(ptr)
+        unsafe { crate::with_c_str!(ptr) }
     }
 
     #[test]
