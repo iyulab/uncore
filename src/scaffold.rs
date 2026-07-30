@@ -418,6 +418,90 @@ macro_rules! export_optional_string_getter {
     };
 }
 
+/// Declare an entry point that hands out a count.
+///
+/// `$body` evaluates to `Result<c_int, FfiError>`. Failure — including a null handle —
+/// returns `-1`, which is why this is its own macro rather than a sentinel argument to a
+/// general one: a sentinel that can be passed in is a sentinel that can be passed wrong.
+///
+/// The slot is cleared on entry like everywhere else, and here that is load-bearing rather
+/// than tidy. A count getter returns a value instead of a pointer, so a caller polling
+/// `<lib>_last_error_kind` after it has no other way to know the recorded failure is not
+/// someone else's.
+///
+/// ```
+/// # use uncore::ffi::LastErrorSlot;
+/// # struct Book { pages: Vec<u8> }
+/// # thread_local! { static LAST_ERROR: LastErrorSlot = const { LastErrorSlot::new() }; }
+/// # uncore::export_last_error_abi!(LAST_ERROR, demo4_last_error, demo4_last_error_kind);
+/// # uncore::export_handle! {
+/// #     /// Handle.
+/// #     handle Demo4Document { inner: Book },
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `doc` must come from this library.
+/// #     free demo4_free_document,
+/// # }
+/// uncore::export_count_getter!(
+///     /// The number of pages, or -1 on failure.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `doc` must be a valid handle.
+///     LAST_ERROR,
+///     demo4_page_count(doc: Demo4Document),
+///     { Ok(unsafe { (*doc).inner.pages.len() } as std::ffi::c_int) }
+/// );
+///
+/// assert_eq!(unsafe { demo4_page_count(std::ptr::null()) }, -1);
+/// assert_eq!(demo4_last_error_kind(), uncore::kind::INVALID_ARGUMENT);
+///
+/// let doc = Box::into_raw(Box::new(Demo4Document { inner: Book { pages: vec![1, 2] } }));
+/// assert_eq!(unsafe { demo4_page_count(doc) }, 2);
+/// assert_eq!(demo4_last_error_kind(), uncore::kind::NONE);
+/// unsafe { demo4_free_document(doc) };
+/// ```
+#[macro_export]
+macro_rules! export_count_getter {
+    (
+        $(#[$meta:meta])*
+        $slot:path,
+        $name:ident($handle:ident: $handle_ty:ty $(, $arg:ident: $arg_ty:ty)* $(,)?),
+        $body:block
+    ) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            $handle: *const $handle_ty,
+            $($arg: $arg_ty,)*
+        ) -> ::std::ffi::c_int {
+            $slot.with(|slot| $crate::ffi::LastErrorSlot::clear(slot));
+
+            if $handle.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument("document is null"),
+                    )
+                });
+                return -1;
+            }
+
+            let counted: ::std::result::Result<::std::ffi::c_int, $crate::ffi::FfiError> =
+                $crate::ffi::catch(|| $body);
+
+            match counted {
+                ::std::result::Result::Ok(count) => count,
+                ::std::result::Result::Err(error) => {
+                    $slot.with(|slot| $crate::ffi::LastErrorSlot::set_error(slot, &error));
+                    -1
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, CString};
@@ -746,5 +830,59 @@ mod tests {
     fn an_optional_getter_rejects_a_null_handle() {
         assert!(unsafe { demo_title(std::ptr::null()) }.is_null());
         assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+    }
+
+    crate::export_count_getter!(
+        /// The number of blobs in the document.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        /// - Returns -1 on failure.
+        DEMO_ERROR,
+        demo_blob_count(doc: DemoDocument),
+        { Ok(unsafe { (*doc).inner.blobs.len() } as ::std::ffi::c_int) }
+    );
+
+    fn demo_with_blob(id: &str, data: &[u8]) -> *mut DemoDocument {
+        let mut blobs = HashMap::new();
+        blobs.insert(id.to_string(), data.to_vec());
+        demo(Demo {
+            blobs,
+            ..Demo::default()
+        })
+    }
+
+    #[test]
+    fn a_count_getter_returns_its_count() {
+        let doc = demo_with_blob("logo.png", b"\x89PNG");
+        assert_eq!(unsafe { demo_blob_count(doc) }, 1);
+        assert_eq!(demo_last_error_kind(), crate::kind::NONE);
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_count_getter_returns_minus_one_for_a_null_handle() {
+        assert_eq!(unsafe { demo_blob_count(std::ptr::null()) }, -1);
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+    }
+
+    /// A count getter returns a value, not a pointer, so a caller cannot tell from the
+    /// return alone whether a recorded failure is theirs. Clearing on entry is what makes
+    /// polling the slot after a count meaningful — the shipped ABI does this and it is
+    /// easy to drop when the body is one line.
+    #[test]
+    fn a_count_getter_clears_a_previous_failure() {
+        assert_eq!(unsafe { demo_blob_count(std::ptr::null()) }, -1);
+        assert_ne!(demo_last_error_kind(), crate::kind::NONE);
+
+        let doc = demo(Demo::default());
+        assert_eq!(unsafe { demo_blob_count(doc) }, 0);
+        assert_eq!(
+            demo_last_error_kind(),
+            crate::kind::NONE,
+            "a count of zero is a success, not a leftover failure"
+        );
+        unsafe { demo_free_document(doc) };
     }
 }
