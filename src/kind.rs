@@ -33,6 +33,22 @@
 //! assume it is free to mean something new — a consumer reading two of these libraries
 //! sees one integer space. Add new reasons from [`COMMON_BAND`] or a library band.
 //!
+//! # Where a failure is attributed
+//!
+//! Two libraries classified the same failure differently — serialising a rendered result
+//! to JSON — because nothing said where it belonged. A shared numbering is only useful if
+//! the same failure lands on the same number, so the rule is stated here rather than
+//! rediscovered:
+//!
+//! **Failing to serialise a rendered result is a rendering failure.** Producing output is
+//! rendering, and it stays rendering when the last step of producing it is serialisation.
+//! It is not a generic failure, and it is not a boundary failure — nothing is wrong with
+//! how the call was made.
+//!
+//! A library with no rendering reason of its own takes one from its own band rather than
+//! reaching for [`OTHER`], which means "this failure carries no classification" and is
+//! worth keeping true.
+//!
 //! # The contract consumers are promised
 //!
 //! Every library in the family documents the same four rules. They are restated here

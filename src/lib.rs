@@ -34,6 +34,9 @@
 //!   future ones from colliding. Read its docs before adding a kind anywhere.
 //! - [`ffi`] — [`ffi::LastErrorSlot`], the [`ffi::catch`] panic guard, and the macros that
 //!   export the ABI over them.
+//! - [`scaffold`] — macros that assemble an entry point out of those primitives. Reach for
+//!   these before writing the five steps by hand; the sentinel differs by return type and
+//!   that is where hand-written entry points drift.
 //!
 //! # A minimal library
 //!
@@ -80,7 +83,7 @@
 //! assert_eq!(mylib_last_error_kind(), kind::NONE);
 //! ```
 
-#![doc(html_root_url = "https://docs.rs/uncore/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/uncore/0.2.0")]
 
 pub mod ffi;
 pub mod kind;

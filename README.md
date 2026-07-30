@@ -28,6 +28,36 @@ Two rules keep it from becoming a dumping ground:
 `std`-only (a `CString` in a `thread_local!`), which suits every consumer including
 `wasm32-unknown-unknown`.
 
+## What is in it
+
+- `kind` — the error-kind values the family already shares, and the bands that keep future
+  ones from colliding.
+- `ffi` — the thread-local last-error slot, the panic guard, and the two boundary failure
+  reasons.
+- `scaffold` — macros that assemble a C entry point out of those primitives.
+
+`ffi` hands out the materials; `scaffold` is the assembly. A string-returning entry point
+is five steps and only one of them mentions the library:
+
+```rust
+uncore::export_string_getter!(
+    /// The document rendered as Markdown.
+    ///
+    /// # Safety
+    ///
+    /// - `doc` must be a valid handle.
+    /// - The returned string must be freed with `mylib_free_string`.
+    LAST_ERROR,
+    mylib_to_markdown(doc: MylibDocument, flags: c_int),
+    { render(&(*doc).inner, flags).map_err(classify) }
+);
+```
+
+The macros are split by return type rather than taking a sentinel, because null and `-1`
+are not interchangeable and a sentinel that can be passed in can be passed wrong.
+Exported names are written in full at the call site: `macro_rules!` cannot build
+identifiers, and a symbol should be greppable where it is declared.
+
 ## What it gives you
 
 ```rust
