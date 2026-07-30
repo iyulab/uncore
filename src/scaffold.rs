@@ -6,7 +6,9 @@
 //! boundary failure reasons. Assembling them is five steps, and only one of them says
 //! anything about the library:
 //!
-//! 1. clear the slot, so a caller polling it does not read a previous failure
+//! 1. clear the slot, so a caller polling it does not read a previous failure. The slot is
+//!    cleared on entry, not on success: a body that itself calls another entry point on
+//!    this thread leaves that call's failure visible
 //! 2. reject a null handle with [`crate::ffi::invalid_argument`] and return the sentinel
 //! 3. run the body inside [`crate::ffi::catch`] ← the only step with domain content
 //! 4. move the result across the ABI, reporting [`crate::ffi::invalid_output`] if it cannot
@@ -512,6 +514,11 @@ macro_rules! export_count_getter {
 /// `Box<[u8]>`, writes its length through `out_len`, and hands over the pointer; the
 /// matching [`export_free_bytes!`](crate::export_free_bytes) reclaims it from the same two
 /// values.
+///
+/// An empty `Vec` is a success like any other: it is handed over as a non-null pointer with
+/// `out_len` set to `0`, distinct from the null this returns on failure. A caller that
+/// treats a zero length as absence will misread an empty result as one that was never
+/// produced.
 ///
 /// # Why every argument is checked before the closure
 ///
