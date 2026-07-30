@@ -309,6 +309,115 @@ macro_rules! export_string_getter {
     };
 }
 
+/// Declare an entry point that hands out a string which may legitimately be absent.
+///
+/// `$body` evaluates to `Result<Option<String>, FfiError>`. `Ok(None)` returns null with
+/// the slot left at success, because absence is not a failure — document metadata that was
+/// never set is the case this exists for.
+///
+/// That makes null ambiguous on its own, and deliberately so: the kind channel is what
+/// separates the three outcomes a caller has to tell apart.
+///
+/// | `$body` | Returns | Kind |
+/// |---|---|---|
+/// | `Ok(Some(text))` | the string | success |
+/// | `Ok(None)` | null | success — there is nothing to give |
+/// | `Ok(Some(text))` holding an interior NUL | null | [`kind::INVALID_OUTPUT`](crate::kind::INVALID_OUTPUT) |
+/// | `Err(..)` | null | whatever the body classified |
+///
+/// Use [`export_string_getter!`](crate::export_string_getter) where absence cannot happen
+/// or is genuinely an empty string. Do not fold the two by defaulting absent to `""` —
+/// that tells a caller the field is set and blank.
+///
+/// ```
+/// # use uncore::ffi::LastErrorSlot;
+/// # struct Meta { author: Option<String> }
+/// # thread_local! { static LAST_ERROR: LastErrorSlot = const { LastErrorSlot::new() }; }
+/// # uncore::export_last_error_abi!(LAST_ERROR, demo3_last_error, demo3_last_error_kind);
+/// # uncore::export_handle! {
+/// #     /// Handle.
+/// #     handle Demo3Document { inner: Meta },
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `doc` must come from this library.
+/// #     free demo3_free_document,
+/// # }
+/// uncore::export_optional_string_getter!(
+///     /// The document author, or null when none is recorded.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `doc` must be a valid handle.
+///     /// - The returned string must be freed by this library.
+///     LAST_ERROR,
+///     demo3_author(doc: Demo3Document),
+///     { Ok(unsafe { (*doc).inner.author.clone() }) }
+/// );
+///
+/// let absent = Box::into_raw(Box::new(Demo3Document { inner: Meta { author: None } }));
+/// assert!(unsafe { demo3_author(absent) }.is_null());
+/// assert_eq!(demo3_last_error_kind(), uncore::kind::NONE);
+/// unsafe { demo3_free_document(absent) };
+/// ```
+#[macro_export]
+macro_rules! export_optional_string_getter {
+    (
+        $(#[$meta:meta])*
+        $slot:path,
+        $name:ident($handle:ident: $handle_ty:ty $(, $arg:ident: $arg_ty:ty)* $(,)?),
+        $body:block
+    ) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            $handle: *const $handle_ty,
+            $($arg: $arg_ty,)*
+        ) -> *mut ::std::ffi::c_char {
+            $slot.with(|slot| $crate::ffi::LastErrorSlot::clear(slot));
+
+            if $handle.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument("document is null"),
+                    )
+                });
+                return ::std::ptr::null_mut();
+            }
+
+            let produced: ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::ffi::FfiError,
+            > = $crate::ffi::catch(|| $body);
+
+            match produced {
+                ::std::result::Result::Ok(::std::option::Option::Some(text)) => {
+                    match ::std::ffi::CString::new(text) {
+                        ::std::result::Result::Ok(owned) => owned.into_raw(),
+                        ::std::result::Result::Err(_) => {
+                            $slot.with(|slot| {
+                                $crate::ffi::LastErrorSlot::set_error(
+                                    slot,
+                                    &$crate::ffi::invalid_output(),
+                                )
+                            });
+                            ::std::ptr::null_mut()
+                        }
+                    }
+                }
+                ::std::result::Result::Ok(::std::option::Option::None) => {
+                    ::std::ptr::null_mut()
+                }
+                ::std::result::Result::Err(error) => {
+                    $slot.with(|slot| $crate::ffi::LastErrorSlot::set_error(slot, &error));
+                    ::std::ptr::null_mut()
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, CString};
@@ -581,5 +690,61 @@ mod tests {
         assert!(returned.is_null());
         assert_eq!(demo_last_error_kind(), crate::kind::PANIC);
         unsafe { demo_free_document(doc) };
+    }
+
+    crate::export_optional_string_getter!(
+        /// The document title.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        /// - Returns null when no title is set, leaving the kind at success.
+        /// - The returned string must be freed with `demo_free_string`.
+        DEMO_ERROR,
+        demo_title(doc: DemoDocument),
+        { Ok(unsafe { (*doc).inner.title.clone() }) }
+    );
+
+    fn demo_with_title(title: Option<&str>) -> *mut DemoDocument {
+        demo(Demo {
+            title: title.map(str::to_string),
+            ..Demo::default()
+        })
+    }
+
+    #[test]
+    fn a_present_optional_value_is_handed_out() {
+        let doc = demo_with_title(Some("Quarterly Report"));
+        assert_eq!(owned(unsafe { demo_title(doc) }), "Quarterly Report");
+        assert_eq!(demo_last_error_kind(), crate::kind::NONE);
+        unsafe { demo_free_document(doc) };
+    }
+
+    /// An absent value is not a failure. This is the whole reason this macro is separate
+    /// from `export_string_getter!`: collapsing absent to an empty string would tell a
+    /// caller there is a title and it is blank.
+    #[test]
+    fn an_absent_optional_value_is_null_and_still_success() {
+        let doc = demo_with_title(None);
+        assert!(unsafe { demo_title(doc) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::NONE);
+        unsafe { demo_free_document(doc) };
+    }
+
+    /// The counterpart: a value that exists but cannot cross must not read as absent.
+    /// Both return null, so the kind is the only thing that separates "there is nothing"
+    /// from "we could not give it to you".
+    #[test]
+    fn an_unrepresentable_optional_value_is_not_reported_as_absent() {
+        let doc = demo_with_title(Some("has\0interior nul"));
+        assert!(unsafe { demo_title(doc) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_OUTPUT);
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn an_optional_getter_rejects_a_null_handle() {
+        assert!(unsafe { demo_title(std::ptr::null()) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
     }
 }
