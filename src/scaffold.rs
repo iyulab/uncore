@@ -207,7 +207,7 @@ macro_rules! export_free_bytes {
 /// is fixed.
 ///
 /// ```
-/// # use std::ffi::{c_char, c_int, CStr};
+/// # use std::ffi::{c_int, CStr};
 /// # use uncore::ffi::LastErrorSlot;
 /// # struct Report { lines: Vec<String> }
 /// # thread_local! { static LAST_ERROR: LastErrorSlot = const { LastErrorSlot::new() }; }
