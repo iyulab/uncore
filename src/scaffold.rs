@@ -190,6 +190,125 @@ macro_rules! export_free_bytes {
     };
 }
 
+/// Declare an entry point that hands out an owned string.
+///
+/// `$body` runs inside [`catch`](crate::ffi::catch) and evaluates to
+/// `Result<String, FfiError>`. Everything around it is the same in every such entry
+/// point: clear the slot, reject a null handle, move the string into a `CString`,
+/// report [`invalid_output`](crate::ffi::invalid_output) if it holds an interior NUL,
+/// record a failure and return null.
+///
+/// The handle parameter's name is taken from the call site so that `$body` can project
+/// through it — `{ Ok((*doc).inner.title()) }`. The handle is `*const`, since producing a
+/// string does not modify the document.
+///
+/// The null-handle message is `"document is null"`, fixed here so the family reports it
+/// identically — the same reason [`invalid_output`](crate::ffi::invalid_output)'s wording
+/// is fixed.
+///
+/// ```
+/// # use std::ffi::{c_char, c_int, CStr};
+/// # use uncore::ffi::LastErrorSlot;
+/// # struct Report { lines: Vec<String> }
+/// # thread_local! { static LAST_ERROR: LastErrorSlot = const { LastErrorSlot::new() }; }
+/// # uncore::export_last_error_abi!(LAST_ERROR, demo2_last_error, demo2_last_error_kind);
+/// # uncore::export_handle! {
+/// #     /// Handle.
+/// #     handle Demo2Document { inner: Report },
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `doc` must come from this library.
+/// #     free demo2_free_document,
+/// # }
+/// # uncore::export_free_string!(
+/// #     /// Free.
+/// #     ///
+/// #     /// # Safety
+/// #     /// `s` must come from this library.
+/// #     demo2_free_string
+/// # );
+/// uncore::export_string_getter!(
+///     /// The report's line at `index`, or a failure when it is out of range.
+///     ///
+///     /// # Safety
+///     ///
+///     /// - `doc` must be a valid handle.
+///     /// - The returned string must be freed with `demo2_free_string`.
+///     LAST_ERROR,
+///     demo2_line(doc: Demo2Document, index: c_int),
+///     {
+///         match unsafe { (&(*doc).inner.lines).get(index as usize) } {
+///             Some(line) => Ok(line.clone()),
+///             None => Err((uncore::kind::OTHER, format!("no line {index}"))),
+///         }
+///     }
+/// );
+///
+/// let doc = Box::into_raw(Box::new(Demo2Document {
+///     inner: Report { lines: vec!["first".to_string()] },
+/// }));
+///
+/// let line = unsafe { demo2_line(doc, 0) };
+/// assert_eq!(unsafe { CStr::from_ptr(line) }.to_str().unwrap(), "first");
+/// unsafe { demo2_free_string(line) };
+///
+/// assert!(unsafe { demo2_line(doc, 9) }.is_null());
+/// assert_eq!(demo2_last_error_kind(), uncore::kind::OTHER);
+///
+/// unsafe { demo2_free_document(doc) };
+/// ```
+#[macro_export]
+macro_rules! export_string_getter {
+    (
+        $(#[$meta:meta])*
+        $slot:path,
+        $name:ident($handle:ident: $handle_ty:ty $(, $arg:ident: $arg_ty:ty)* $(,)?),
+        $body:block
+    ) => {
+        $(#[$meta])*
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            $handle: *const $handle_ty,
+            $($arg: $arg_ty,)*
+        ) -> *mut ::std::ffi::c_char {
+            $slot.with(|slot| $crate::ffi::LastErrorSlot::clear(slot));
+
+            if $handle.is_null() {
+                $slot.with(|slot| {
+                    $crate::ffi::LastErrorSlot::set_error(
+                        slot,
+                        &$crate::ffi::invalid_argument("document is null"),
+                    )
+                });
+                return ::std::ptr::null_mut();
+            }
+
+            let produced: ::std::result::Result<::std::string::String, $crate::ffi::FfiError> =
+                $crate::ffi::catch(|| $body);
+
+            match produced {
+                ::std::result::Result::Ok(text) => match ::std::ffi::CString::new(text) {
+                    ::std::result::Result::Ok(owned) => owned.into_raw(),
+                    ::std::result::Result::Err(_) => {
+                        $slot.with(|slot| {
+                            $crate::ffi::LastErrorSlot::set_error(
+                                slot,
+                                &$crate::ffi::invalid_output(),
+                            )
+                        });
+                        ::std::ptr::null_mut()
+                    }
+                },
+                ::std::result::Result::Err(error) => {
+                    $slot.with(|slot| $crate::ffi::LastErrorSlot::set_error(slot, &error));
+                    ::std::ptr::null_mut()
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, CString};
@@ -319,5 +438,148 @@ mod tests {
         let mut byte = 7u8;
         unsafe { demo_free_bytes(&mut byte, 0) };
         assert_eq!(byte, 7);
+    }
+
+    crate::export_string_getter!(
+        /// The document body.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        /// - The returned string must be freed with `demo_free_string`.
+        DEMO_ERROR,
+        demo_body(doc: DemoDocument),
+        { Ok(unsafe { (*doc).inner.body.clone() }) }
+    );
+
+    crate::export_string_getter!(
+        /// The document body, repeated `times` times.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        /// - The returned string must be freed with `demo_free_string`.
+        DEMO_ERROR,
+        demo_body_repeated(doc: DemoDocument, times: ::std::ffi::c_int),
+        { Ok(unsafe { (*doc).inner.body.repeat(times.max(0) as usize) }) }
+    );
+
+    crate::export_string_getter!(
+        /// The document body, or a classified failure when it is empty.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        DEMO_ERROR,
+        demo_body_or_fail(doc: DemoDocument),
+        {
+            let body = unsafe { &(*doc).inner.body };
+            if body.is_empty() {
+                return Err((crate::kind::IO, "no body".to_string()));
+            }
+            Ok(body.clone())
+        }
+    );
+
+    crate::export_string_getter!(
+        /// Always panics, to prove the guard is in place.
+        ///
+        /// # Safety
+        ///
+        /// - `doc` must be a valid handle.
+        // Passed through to the generated item, which also proves the macro forwards
+        // arbitrary attributes and not only doc comments.
+        #[allow(unreachable_code)]
+        DEMO_ERROR,
+        demo_body_panics(doc: DemoDocument),
+        { panic!("deliberate") }
+    );
+
+    fn owned(text: *mut c_char) -> String {
+        assert!(!text.is_null());
+        let owned = unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { demo_free_string(text) };
+        owned
+    }
+
+    fn demo_with_body(body: &str) -> *mut DemoDocument {
+        demo(Demo {
+            body: body.to_string(),
+            ..Demo::default()
+        })
+    }
+
+    #[test]
+    fn a_string_getter_returns_its_value_and_reports_success() {
+        let doc = demo_with_body("hello");
+        assert_eq!(owned(unsafe { demo_body(doc) }), "hello");
+        assert_eq!(demo_last_error_kind(), crate::kind::NONE);
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_string_getter_passes_its_extra_arguments_to_the_body() {
+        let doc = demo_with_body("ab");
+        assert_eq!(owned(unsafe { demo_body_repeated(doc, 3) }), "ababab");
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_null_handle_is_an_invalid_argument_named_document() {
+        assert!(unsafe { demo_body(std::ptr::null()) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_ARGUMENT);
+        let message = unsafe { std::ffi::CStr::from_ptr(demo_last_error()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            message, "document is null",
+            "the family reports this identically, so the wording is fixed here"
+        );
+    }
+
+    /// The reason a caller can poll the slot after a *successful* call: it was cleared on
+    /// entry, so a leftover failure cannot be attributed to this call.
+    #[test]
+    fn a_successful_call_clears_a_previous_failure() {
+        assert!(unsafe { demo_body(std::ptr::null()) }.is_null());
+        assert_ne!(demo_last_error_kind(), crate::kind::NONE);
+
+        let doc = demo_with_body("fresh");
+        assert_eq!(owned(unsafe { demo_body(doc) }), "fresh");
+        assert_eq!(demo_last_error_kind(), crate::kind::NONE);
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_classified_body_failure_reaches_the_slot() {
+        let doc = demo_with_body("");
+        assert!(unsafe { demo_body_or_fail(doc) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::IO);
+        unsafe { demo_free_document(doc) };
+    }
+
+    /// An interior NUL is the one failure the macro raises by itself: the value exists and
+    /// is correct, it just cannot be a C string.
+    #[test]
+    fn a_value_holding_an_interior_nul_is_reported_not_truncated() {
+        let doc = demo_with_body("before\0after");
+        assert!(unsafe { demo_body(doc) }.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::INVALID_OUTPUT);
+        unsafe { demo_free_document(doc) };
+    }
+
+    #[test]
+    fn a_panic_in_the_body_does_not_cross_the_boundary() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let doc = demo_with_body("x");
+        let returned = unsafe { demo_body_panics(doc) };
+        std::panic::set_hook(previous);
+
+        assert!(returned.is_null());
+        assert_eq!(demo_last_error_kind(), crate::kind::PANIC);
+        unsafe { demo_free_document(doc) };
     }
 }
