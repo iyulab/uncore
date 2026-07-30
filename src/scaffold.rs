@@ -291,8 +291,10 @@ mod tests {
     fn a_handle_round_trips_through_its_free_function() {
         let doc = demo(Demo::default());
         assert!(!doc.is_null());
-        // A leak would show up under the test harness's allocator, and a double free
-        // would abort; this asserts the pair exists and accepts what the other produced.
+        // A smoke test, deliberately: a stock `cargo test` run has no leak detector, so
+        // this cannot show the allocation was returned. What it does show is that the
+        // pair agrees on the pointer — a mismatched type or an extra indirection would
+        // abort here.
         unsafe { demo_free_document(doc) };
     }
 
@@ -305,11 +307,15 @@ mod tests {
         }
     }
 
+    /// A zero length must leave the caller's buffer alone.
+    ///
+    /// This pins the observable contract, not the guard: dropping a zero-length
+    /// `Box<[u8]>` would not reach the allocator either, since `Global::deallocate`
+    /// skips a zero-size layout. The `len > 0` guard earns its keep elsewhere — it means
+    /// no `Box` is ever reconstructed from a pointer at all, which is what a
+    /// provenance-checking run would object to.
     #[test]
     fn free_bytes_ignores_a_zero_length_buffer() {
-        // The shipped ABI guards on `len > 0`, so a caller passing a real pointer with a
-        // zero length must not have it reclaimed. Pinned because the guard reads like a
-        // redundant check and is not one.
         let mut byte = 7u8;
         unsafe { demo_free_bytes(&mut byte, 0) };
         assert_eq!(byte, 7);
