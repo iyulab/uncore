@@ -1,9 +1,24 @@
 # uncore
 
+[![crates.io](https://img.shields.io/crates/v/uncore.svg)](https://crates.io/crates/uncore)
+[![docs.rs](https://docs.rs/uncore/badge.svg)](https://docs.rs/uncore)
+[![CI](https://github.com/iyulab/uncore/actions/workflows/ci.yml/badge.svg)](https://github.com/iyulab/uncore/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Shared C-ABI plumbing and error-kind conventions for the `un*` document extraction
 family — [unpdf](https://github.com/iyulab/unpdf) (PDF),
 [undoc](https://github.com/iyulab/undoc) (DOCX/XLSX/PPTX),
 [unhwp](https://github.com/iyulab/unhwp) (HWP/HWPX).
+
+## Install
+
+```toml
+[dependencies]
+uncore = "0.2"
+```
+
+Requires Rust 1.87. Has no dependencies of its own, and builds for every target its
+consumers use, including `wasm32-unknown-unknown`.
 
 ## Why this exists
 
@@ -58,7 +73,11 @@ are not interchangeable and a sentinel that can be passed in can be passed wrong
 Exported names are written in full at the call site: `macro_rules!` cannot build
 identifiers, and a symbol should be greppable where it is declared.
 
-## What it gives you
+## The primitives underneath
+
+The macros are assembled from these, and they stay public: an entry point whose shape no
+macro fits is written by hand out of the same pieces. Written out, one looks like this —
+which is what a macro spares you at every entry point but one:
 
 ```rust
 use std::ffi::c_int;
@@ -100,9 +119,19 @@ pub extern "C" fn mylib_page_count(handle: *const u8) -> c_int {
 - `ffi::catch` — turns a panic into `kind::PANIC` instead of undefined behaviour.
 - `ffi::FfiError` — `(kind, message)`, carried out of closures so the classification is
   not lost to an early `to_string()`.
+- `ffi::c_str_utf8` / `with_c_str!` — read a C string argument, classifying null and
+  non-UTF-8. Neither hides the unsafe read: the call site keeps the obligation, because a
+  macro cannot check a pointer's provenance.
 - `export_last_error_abi!` — declares `<lib>_last_error` and `<lib>_last_error_kind`.
 - `assert_stable_kinds!` — turns an accidental renumbering into a test failure.
 - `kind` — the values the family already shares, and bands for future ones.
+
+And the entry-point macros in `scaffold`, one per return shape — `export_handle!`,
+`export_string_getter!`, `export_optional_string_getter!`, `export_count_getter!`,
+`export_bytes_getter!`, `export_free_string!`, `export_free_bytes!`.
+`export_optional_string_getter!` is the one worth reading the docs for: it keeps "there is
+nothing" distinct from "we could not give it to you", which both return null and are told
+apart only by the kind.
 
 ### Why the slot is yours
 
